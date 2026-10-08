@@ -1,190 +1,206 @@
-const { hybridSearch } = require("../services/vectorService");
-const { GoogleGenAI } = require("@google/genai");
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const { executeHybridSearch } = require("../services/hybridSearch");
+const { generateGroundedAnswer } = require("../services/groundingService");
+const {
+  getSessionContext,
+  enrichQueryWithContext,
+  addSessionMessage,
+  clearSession,
+} = require("../services/sessionService");
+const QueryLog = require("../models/QueryLog");
 const ChatMeta = require("../models/ChatMeta");
+const PolicyChunk = require("../models/PolicyChunk");
 const { getAuth } = require("@clerk/express");
 
-const {
-  addMessageToChat,
-  searchCurrentChat,
-  searchMasterMemory,
-  summarizeAndStore
-} = require("../services/memoryService");
-
-const MAX_MESSAGES = 80;
-
+/**
+ * Handles policy query requests for municipal employees.
+ * Supports hybrid search, short-term context enrichment, and grounded generation.
+ */
 const chatWithAI = async (req, res) => {
+  const startTime = Date.now();
+
   try {
-    const { userId } = getAuth(req);
+    const auth = getAuth(req);
+    let userId = auth?.userId;
+
+    if (!userId && process.env.NODE_ENV === "test") {
+      userId = req.headers["x-user-id"] || "dev_employee_user";
+    }
 
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized"
+        message: "Authentication required. Please sign in with your citizen account to ask policy questions.",
       });
     }
 
-    let { message, chatId } = req.body;
+    const question = (req.body.question || req.body.message || req.body.prompt || "").trim();
+    let chatId = req.body.session_id || req.body.chatId || req.body.sessionId;
 
-    if (!message || !message.trim()) {
+    if (!question) {
       return res.status(400).json({
         success: false,
-        message: "Message is required"
+        message: "A question or message is required.",
       });
     }
 
-    let chatMeta;
-
-    if (chatId) {
-      chatMeta = await ChatMeta.findOne({ chatId, userId });
-
-      if (!chatMeta) {
-        return res.status(404).json({
-          success: false,
-          message: "Chat not found"
-        });
-      }
-
-      if (chatMeta.messageCount >= MAX_MESSAGES) {
-        return res.status(400).json({
-          success: false,
-          message: "Chat limit reached. Please start a new chat.",
-          limitReached: true
-        });
-      }
-    } else {
-      chatId = `chat_${userId}_${Date.now()}`;
-
-      chatMeta = new ChatMeta({
-        chatId,
-        userId,
-        title:
-          message.substring(0, 30) +
-          (message.length > 30 ? "..." : "")
-      });
-
-      await chatMeta.save();
+    if (!chatId) {
+      chatId = `session_${userId}_${Date.now()}`;
     }
 
+    const department = (req.body.department || req.body.category || "").trim();
 
+    // Step 1: Context enrichment for conversational follow-ups
+    const effectiveQuery = enrichQueryWithContext(question, chatId);
+    const recentContext = getSessionContext(chatId, 4);
 
-    const [globalResults, chatResults, memoryResults] =
-      await Promise.all([
-        hybridSearch(message, 6),
-        searchCurrentChat(chatId, message, 5),
-        searchMasterMemory(message, userId, 3)
-      ]);
+    console.log(
+      `Query: "${question}" -> Effective Retrieval Query: "${effectiveQuery}" ${
+        department ? `[Department: ${department}]` : "[All Departments]"
+      }`
+    );
 
-    const globalContext = globalResults
-      .map((r) => r.text)
-      .join("\n\n");
-
-    const chatContext = chatResults.join("\n\n");
-    const memoryContext = memoryResults.join("\n\n");
-
-    const fullContext = `
-[Global Knowledge]
-${globalContext || "None"}
-
-[Past Chat Memories]
-${memoryContext || "None"}
-
-[Recent Context in This Chat]
-${chatContext || "None"}
-`;
-
-    const prompt = `
-You are the AI Front Desk Receptionist for Sunrise Public School.
-
-Your role is to assist parents, students, teachers, and visitors with inquiries regarding school timings, admissions, fee structures, examinations, holidays, teachers, transport, sports, and general school policies.
-
-Greeting & Demeanor Guidelines:
-- If the user greets you (e.g., "hello", "hi", "good morning", "hey"), warmly welcome them to the school reception: "Hello! Welcome to Sunrise Public School. How can I assist you with our school admissions, timings, fees, or facilities today?"
-- Maintain a warm, polite, respectful, and helpful school receptionist demeanor at all times.
-- Deliver responses in natural, fluent, and articulate spoken sentences that are pleasant to listen to.
-- For fees, timings, or dates, state the numbers clearly (e.g., ₹45,000, 8:00 AM to 2:30 PM).
-- If the information is genuinely not available in the context, politely let the user know and offer to connect them with the school office (Office Phone: 0141-400-1234, Monday to Friday 9:00 AM to 4:00 PM).
-- Use standard natural sentence casing (never respond in all uppercase words).
-- Never mention technical terms like "context", "database", "retrieval", or "vectors".
-
-Context:
-${fullContext}
-
-User question:
-${message}
-
-Answer:
-`;
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash-lite',
-      contents: prompt,
+    // Step 2: Hybrid Search (Pinecone Vector + BM25 Keyword + RRF Fusion scoped by department)
+    const candidates = await executeHybridSearch(effectiveQuery, {
+      topK: 15,
+      department: department && department !== "All" ? department : null,
+      filter: { status: { $eq: "active" } },
     });
 
-    const answer = response.text;
+    // Step 3: Grounded LLM Generation with Anti-Hallucination & Citations
+    const groundedResult = await generateGroundedAnswer(question, candidates, {
+       recentContext,
+     });
 
-
-
-    await addMessageToChat(
-      chatId,
-      message,
-      "user",
-      chatMeta.messageCount
-    );
-
-    await addMessageToChat(
-      chatId,
-      answer,
-      "ai",
-      chatMeta.messageCount + 1
-    );
-
-    chatMeta.messageCount += 2;
-
-    if (
-      chatMeta.messageCount >= MAX_MESSAGES &&
-      !chatMeta.isSummarized
-    ) {
-      chatMeta.isSummarized = true;
-      summarizeAndStore(chatId, userId).catch(console.error);
-    }
-
-    // If this is the very first message exchange, generate a smart title
-    if (chatMeta.messageCount === 2) {
-      try {
-        const titlePrompt = `Write a very short, 2 to 4 word summary title for this chat. 
-User said: "${message}"
-AI answered: "${answer.substring(0, 200)}..."
-Only return the title, no quotes, no extra text.`;
-        const titleRes = await ai.models.generateContent({
-          model: 'gemini-3.5-flash-lite',
-          contents: titlePrompt,
-        });
-        chatMeta.title = titleRes.text.replace(/["']/g, '').trim();
-      } catch (e) {
-        console.error("Failed to generate smart title:", e);
+    // Enrich sources with actual document total page count
+    if (groundedResult.sources && groundedResult.sources.length > 0) {
+      for (const src of groundedResult.sources) {
+        if (src.document_id) {
+          try {
+            const docPages = await PolicyChunk.find({ documentId: src.document_id, status: "ACTIVE" })
+              .select("pageNumber")
+              .lean();
+            src.total_pages = docPages.reduce((max, c) => Math.max(max, c.pageNumber || 1), 1);
+          } catch (e) {
+            src.total_pages = 1;
+          }
+        } else {
+          src.total_pages = 1;
+        }
       }
     }
 
-    await chatMeta.save();
+    const latencyMs = Date.now() - startTime;
 
+    // Step 4: Record conversation turn in fast memory
+    addSessionMessage(chatId, "user", question);
+    addSessionMessage(chatId, "assistant", groundedResult.answer);
+
+    // Step 5: Persist conversation turn and latest citation in MongoDB ChatMeta
+    try {
+      const topSrc = groundedResult.sources && groundedResult.sources[0];
+      const latestCitation = topSrc
+        ? {
+            document: topSrc.document_title || topSrc.file_name || "Official Policy Document",
+            page: topSrc.page || 1,
+            paragraph: `Section: ${topSrc.section || "General"} (Para ${topSrc.paragraph || 1})`,
+            proofText: topSrc.supporting_text || topSrc.text || groundedResult.answer,
+          }
+        : {
+            document: "Official Municipal Circular",
+            page: 1,
+            paragraph: "General Directives",
+            proofText: groundedResult.answer,
+          };
+
+      const messageTurn = {
+        id: `turn_${Date.now()}`,
+        question,
+        answer: groundedResult.answer,
+        grounded: groundedResult.grounded,
+        confidence: groundedResult.confidence,
+        sources: groundedResult.sources || [],
+        department: department || null,
+        createdAt: new Date(),
+      };
+
+      await ChatMeta.findOneAndUpdate(
+        { chatId, userId },
+        {
+          $inc: { messageCount: 2 },
+          $set: {
+            latestCitation,
+            updatedAt: new Date(),
+          },
+          $push: { messages: messageTurn },
+          $setOnInsert: {
+            title: question.substring(0, 45) + (question.length > 45 ? "..." : ""),
+          },
+        },
+        { upsert: true, new: true }
+      );
+    } catch (chatMetaErr) {
+      console.warn("Could not persist ChatMeta:", chatMetaErr.message);
+    }
+
+    // Step 5: Log query for governance and quality evaluation
+    try {
+      await QueryLog.create({
+        employeeId: userId,
+        question,
+        answer: groundedResult.answer,
+        confidence: groundedResult.confidence,
+        grounded: groundedResult.grounded,
+        conflictDetected: groundedResult.conflict_detected,
+        sourceIds: groundedResult.sources.map((s) => s.chunk_id),
+        sources: groundedResult.sources,
+        latencyMs,
+      });
+    } catch (logErr) {
+      console.warn("Failed to save QueryLog:", logErr.message);
+    }
+
+    // Step 6: Return structured response
     res.json({
       success: true,
+      session_id: chatId,
       chatId,
-      question: message,
-      answer,
-      context: fullContext,
-      limitReached: chatMeta.messageCount >= MAX_MESSAGES
+      question,
+      answer: groundedResult.answer,
+      confidence: groundedResult.confidence,
+      grounded: groundedResult.grounded,
+      conflict_detected: groundedResult.conflict_detected,
+      conflict_notes: groundedResult.conflict_notes,
+      sources: groundedResult.sources,
+      citations: groundedResult.citations || groundedResult.sources,
+      references: groundedResult.references || [],
+      suggested_citizen_response: groundedResult.suggested_citizen_response,
+      latency_ms: latencyMs,
     });
   } catch (error) {
-    console.error("AI Chat Error:", error);
-
+    console.error("Policy Query Error:", error);
     res.status(500).json({
       success: false,
-      message: "Failed to generate AI response",
-      error: error.message
+      message: "An error occurred while answering your municipal policy query.",
+      error: error.message,
     });
   }
 };
 
-module.exports = { chatWithAI };
+const createSession = (req, res) => {
+  const userId = req.headers["x-user-id"] || "employee";
+  const sessionId = `session_${userId}_${Date.now()}`;
+  res.json({ success: true, session_id: sessionId });
+};
+
+const deleteSession = (req, res) => {
+  const sessionId = req.params.sessionId || req.params.chatId;
+  clearSession(sessionId);
+  res.json({ success: true, message: `Session ${sessionId} cleared.` });
+};
+
+module.exports = {
+  chatWithAI,
+  handlePolicyQuery: chatWithAI,
+  createSession,
+  deleteSession,
+};

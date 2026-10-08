@@ -81,9 +81,12 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 
+const clerkPublishableKey =
+  process.env.CLERK_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+
 app.use(
   clerkMiddleware({
-    publishableKey: process.env.CLERK_PUBLISHABLE_KEY,
+    publishableKey: clerkPublishableKey,
     secretKey: process.env.CLERK_SECRET_KEY,
   })
 );
@@ -92,13 +95,16 @@ app.use(
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "Voice Chatbot Server is running",
+    message: "Municipal Policy AI Copilot Server is running",
   });
 });
 
 const adminRoutes = require("./routes/adminRoutes");
+const sourceRoutes = require("./routes/sourceRoutes");
 
 app.use("/api/chat", chatRoutes);
+app.use("/api/query", chatRoutes);
+app.use("/api/sources", sourceRoutes);
 app.use("/api/admin", adminRoutes);
 
 app.use((err, req, res, next) => {
